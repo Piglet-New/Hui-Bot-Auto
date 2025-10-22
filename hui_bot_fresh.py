@@ -332,11 +332,16 @@ async def cmd_hen(upd: Update, ctx: ContextTypes.DEFAULT_TYPE):
         assert re.fullmatch(r"\d{2}:\d{2}", hhmm)
     except:
         return await upd.message.reply_text("❌ Cú pháp: `/hen <ma_day> <HH:MM>`", parse_mode="Markdown")
+
     conn = db()
     conn.execute("INSERT INTO reminders(line_id, at_hhmm) VALUES(?,?)", (line_id, hhmm))
     conn.commit(); conn.close()
-    await upd.message.reply_text(f"⏰ Đã đặt nhắc cho dây #{line_id} lúc {hhmm} mỗi {'tuần' if load_line(line_id)['period_days']==7 else 'tháng'}. "
-                                 f\"Tuần này bạn đoán thăm bao nhiêu? 😉\"")
+
+    typ = "tuần" if load_line(line_id)['period_days'] == 7 else "tháng"
+    await upd.message.reply_text(
+        f"⏰ Đã đặt nhắc cho dây #{line_id} lúc {hhmm} mỗi {typ}. "
+        f"Tuần này bạn đoán thăm bao nhiêu? 😉"
+    
 
 async def cmd_dong(upd: Update, ctx: ContextTypes.DEFAULT_TYPE):
     try: line_id = int(ctx.args[0])
@@ -366,23 +371,33 @@ async def monthly_report(ctx: ContextTypes.DEFAULT_TYPE):
     await ctx.bot.send_message(chat_id=chat_id, text="📊 **Báo cáo tháng**:\n" + "\n".join(lines), parse_mode="Markdown")
 
 async def daily_reminders(ctx: ContextTypes.DEFAULT_TYPE):
-    """Mỗi phút quét lịch nhắc theo HH:MM; gửi câu dí dỏm tuỳ dây tuần/tháng."""
+    """Mỗi phút quét lịch nhắc theo HH:MM; gửi câu dí dỏm theo dây tuần/tháng."""
     now = datetime.now()
-    hhmm = now.strftime("%H:%M")
+    hhmm_now = now.strftime("%H:%M")
+
+    # gửi vào chat đã đặt /baocao; nếu chưa cấu hình thì bỏ qua
+    cfg = load_cfg()
+    chat_id = cfg.get("report_chat_id")
+    if not chat_id:
+        return
+
     conn = db()
     rs = conn.execute("""
         SELECT r.line_id, r.at_hhmm, l.name, l.period_days
-        FROM reminders r JOIN lines l ON l.id=r.line_id
-        WHERE r.at_hhmm=?
-    """, (hhmm,)).fetchall()
+        FROM reminders r
+        JOIN lines l ON l.id = r.line_id
+        WHERE r.at_hhmm = ?
+    """, (hhmm_now,)).fetchall()
     conn.close()
-    for line_id, hhmm, name, pdays in rs:
-        style = "tuần" if pdays==7 else "tháng"
-        text = (f"⏰ Nhắc dây #{line_id} – {name} ({style})\n"
-                f"Hôm nay là giờ nhắc {hhmm} — bạn đoán **thăm** bao nhiêu đây? 😉\n"
-                f"Gõ: `/tham {line_id} <ky> <so_tien_tham>`",
-                )
-        await ctx.bot.send_message(chat_id=load_cfg().get("report_chat_id", None) or ctx.application.bot.id, text=text[0], parse_mode="Markdown")
+
+    for line_id, at_hhmm, name, pdays in rs:
+        style = "tuần" if pdays == 7 else "tháng"
+        text = (
+            f"⏰ Nhắc dây #{line_id} – {name} ({style})\n"
+            f"Đến giờ {at_hhmm} rồi — bạn đoán **thăm** bao nhiêu đây? 😉\n"
+            f"Gõ nhanh: `/tham {line_id} <ky> <so_tien_tham>`"
+        )
+        await ctx.bot.send_message(chat_id=chat_id, text=text, parse_mode="Markdown")
 
 def schedule_jobs(app):
     # báo cáo tháng – cứ 24h tick 1 lần, hàm tự kiểm tra mùng 1
