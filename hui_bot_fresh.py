@@ -1,21 +1,23 @@
 # hui_bot_fresh.py
-# pip install python-telegram-bot==20.3 pandas
-import os, sqlite3, json, math
+# Dependencies: python-telegram-bot==20.3, pandas
+import os, sqlite3, json
 from datetime import datetime, timedelta, time as dtime
-from typing import Tuple, Optional
 import pandas as pd
 from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
 
 # ========= CONFIG =========
-TOKEN = os.getenv("TELEGRAM_TOKEN", "").strip()  # <-- LẤY TỪ ENV
+# Đọc token từ TELEGRAM_TOKEN hoặc BOT_TOKEN (linh hoạt theo env bạn đã tạo)
+TOKEN = (os.getenv("TELEGRAM_TOKEN") or os.getenv("BOT_TOKEN") or "").strip()
 if not TOKEN:
-    raise SystemExit("Missing TELEGRAM_TOKEN in environment variables")
+    raise SystemExit("Missing TELEGRAM_TOKEN/BOT_TOKEN in environment variables")
+
 DB_FILE = "hui.db"
 CONFIG_FILE = "config.json"
-REPORT_HOUR = 8       # báo cáo tháng vào 08:00
+REPORT_HOUR = 8  # báo cáo tháng vào 08:00
 # =========================
 
+# ---------- DB ----------
 def db():
     conn = sqlite3.connect(DB_FILE)
     conn.execute("PRAGMA foreign_keys = ON")
@@ -45,61 +47,83 @@ def init_db():
         amount INTEGER NOT NULL,
         FOREIGN KEY(line_id) REFERENCES lines(id) ON DELETE CASCADE
     )""")
-    conn.commit(); conn.close()
+    conn.commit()
+    conn.close()
 
 def load_cfg():
     if os.path.exists(CONFIG_FILE):
         try:
             return json.load(open(CONFIG_FILE, "r", encoding="utf-8"))
-        except:
+        except Exception:
             return {}
     return {}
 
 def save_cfg(cfg: dict):
     json.dump(cfg, open(CONFIG_FILE, "w", encoding="utf-8"))
 
-def parse_date(s: str):  return datetime.strptime(s, "%Y-%m-%d")
-def fmt_money(x: float): return f"{int(round(x)):,} VND"
+def parse_date(s: str):
+    return datetime.strptime(s, "%Y-%m-%d")
 
-def calc_pool(line):      return int(line["legs"] * line["contrib"])
-def calc_discount(line):
+def fmt_money(x: float):
+    return f"{int(round(x)):,} VND"
+
+# ---------- TÍNH TOÁN ----------
+def calc_pool(line):            # Tổng “hụi” 1 kỳ nếu tất cả góp đủ
+    return int(line["legs"] * line["contrib"])
+
+def calc_discount(line):        # Giá hốt (chiết khấu) cố định/%
     pool = calc_pool(line)
-    return float(line["bid_value"]) if line["bid_type"]=="amount" else pool*float(line["bid_value"])/100.0
-def payout(line):         return calc_pool(line) - calc_discount(line)
-def k_date(line, k):      return parse_date(line["start_date"]) + timedelta(days=(k-1)*line["period_days"])
+    return float(line["bid_value"]) if line["bid_type"] == "amount" else pool * float(line["bid_value"]) / 100.0
+
+def payout(line):               # Số tiền thực nhận khi hốt mỗi kỳ
+    return calc_pool(line) - calc_discount(line)
+
+def k_date(line, k):            # Ngày của kỳ k
+    return parse_date(line["start_date"]) + timedelta(days=(k - 1) * line["period_days"])
+
 def compute_profit_for_k(line, k):
-    pay_so_far = (k-1) * line["contrib"]
+    # Lợi nhuận nếu hốt tại kỳ k (đơn giản: tiền nhận hốt - tổng đã góp tới k-1)
+    pay_so_far = (k - 1) * line["contrib"]
     profit = payout(line) - pay_so_far
-    base = pay_so_far if pay_so_far>0 else line["contrib"]
+    base = pay_so_far if pay_so_far > 0 else max(line["contrib"], 1)
     roi = profit / base
     return profit, roi
+
 def best_k(line, metric="roi"):
     bestk, bestkey, bestp, bestroi = 1, -1e18, 0.0, 0.0
-    for k in range(1, line["legs"]+1):
+    for k in range(1, line["legs"] + 1):
         p, r = compute_profit_for_k(line, k)
-        key = r if metric=="roi" else p
+        key = r if metric == "roi" else p
         if key > bestkey:
             bestk, bestkey, bestp, bestroi = k, key, p, r
     return bestk, bestp, bestroi
+
 def is_finished(line):
-    if line["status"]=="CLOSED": return True
+    if line["status"] == "CLOSED":
+        return True
     last = k_date(line, line["legs"]).date()
     return datetime.now().date() >= last
-def roi_to_str(r): return f"{r*100:.2f}%"
+
+def roi_to_str(r): return f"{r * 100:.2f}%"
 
 # ---------- DB helpers ----------
 def load_line_full(line_id: int):
     conn = db()
     row = conn.execute("SELECT * FROM lines WHERE id=?", (line_id,)).fetchone()
     if not row:
-        conn.close(); return None, pd.DataFrame()
-    cols = ["id","name","period_days","start_date","legs","contrib","bid_type","bid_value","status","created_at"]
+        conn.close()
+        return None, pd.DataFrame()
+    cols = ["id", "name", "period_days", "start_date", "legs", "contrib",
+            "bid_type", "bid_value", "status", "created_at"]
     line = dict(zip(cols, row))
-    pays = pd.read_sql_query("SELECT pay_date, amount FROM payments WHERE line_id=? ORDER BY pay_date", conn, params=(line_id,))
+    pays = pd.read_sql_query(
+        "SELECT pay_date, amount FROM payments WHERE line_id=? ORDER BY pay_date",
+        conn, params=(line_id,)
+    )
     conn.close()
     return line, pays
 
-# ---------- Commands ----------
+# ---------- COMMANDS ----------
 async def cmd_start(upd: Update, ctx: ContextTypes.DEFAULT_TYPE):
     msg = (
         "👋 Hụi Bot (SQLite, không cần Google Sheets)\n\n"
@@ -119,26 +143,33 @@ async def cmd_start(upd: Update, ctx: ContextTypes.DEFAULT_TYPE):
 async def cmd_setreport(upd: Update, ctx: ContextTypes.DEFAULT_TYPE):
     cfg = load_cfg()
     if ctx.args:
-        try: cid = int(ctx.args[0])
-        except: return await upd.message.reply_text("❌ chat_id không hợp lệ.")
+        try:
+            cid = int(ctx.args[0])
+        except Exception:
+            return await upd.message.reply_text("❌ chat_id không hợp lệ.")
     else:
         cid = upd.effective_chat.id
     cfg["report_chat_id"] = cid
     save_cfg(cfg)
-    await upd.message.reply_text(f"✅ Đã lưu nơi nhận báo cáo tự động: {cid} — bot sẽ gửi vào 08:00 ngày 1 hàng tháng.")
+    await upd.message.reply_text(
+        f"✅ Đã lưu nơi nhận báo cáo tự động: {cid} — bot sẽ gửi vào 08:00 ngày 1 hàng tháng."
+    )
 
 async def cmd_new(upd: Update, ctx: ContextTypes.DEFAULT_TYPE):
     try:
         name, kind, start, legs, contrib, bid_type, bid_val = ctx.args
-        period_days = 7 if kind.lower() in ["tuan","tuần","week","weekly"] else 30
+        period_days = 7 if kind.lower() in ["tuan", "tuần", "week", "weekly"] else 30
         legs, contrib = int(legs), int(contrib)
         bid_type = bid_type.lower()
-        if bid_type not in ("amount","percent"): raise ValueError("bid_type phải là amount hoặc percent")
+        if bid_type not in ("amount", "percent"):
+            raise ValueError("bid_type phải là amount hoặc percent")
         bid_val = float(bid_val)
         conn = db()
-        conn.execute("""INSERT INTO lines(name,period_days,start_date,legs,contrib,bid_type,bid_value,status,created_at)
-                        VALUES(?,?,?,?,?,?,?,'OPEN',?)""",
-                     (name, period_days, start, legs, contrib, bid_type, bid_val, datetime.now().isoformat()))
+        conn.execute(
+            """INSERT INTO lines(name,period_days,start_date,legs,contrib,bid_type,bid_value,status,created_at)
+               VALUES(?,?,?,?,?,?,?,'OPEN',?)""",
+            (name, period_days, start, legs, contrib, bid_type, bid_val, datetime.now().isoformat())
+        )
         conn.commit()
         line_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
         conn.close()
@@ -147,52 +178,58 @@ async def cmd_new(upd: Update, ctx: ContextTypes.DEFAULT_TYPE):
             f"Số chân: {legs} | Góp/kỳ: {contrib:,} VND | Giá hốt: {bid_type} {bid_val}"
         )
     except Exception as e:
-        await upd.message.reply_text(f"❌ Sai cú pháp.\nVD: /new 2tr tuan 2025-10-22 27 1000000 percent 12.5\n{e}")
+        await upd.message.reply_text(
+            "❌ Sai cú pháp.\nVD: /new 2tr tuan 2025-10-22 27 1000000 percent 12.5\n" + str(e)
+        )
 
 async def cmd_list(upd: Update, ctx: ContextTypes.DEFAULT_TYPE):
     conn = db()
-    rows = conn.execute("SELECT id,name,period_days,start_date,legs,contrib,bid_type,bid_value,status FROM lines ORDER BY id DESC").fetchall()
+    rows = conn.execute(
+        "SELECT id,name,period_days,start_date,legs,contrib,bid_type,bid_value,status "
+        "FROM lines ORDER BY id DESC"
+    ).fetchall()
     conn.close()
-    if not rows: return await upd.message.reply_text("📂 Chưa có dây nào.")
+    if not rows:
+        return await upd.message.reply_text("📂 Chưa có dây nào.")
     out = ["📋 Danh sách dây:"]
     for r in rows:
-        kind = "Tuần" if r[2]==7 else "Tháng"
-        out.append(f"#{r[0]} · {r[1]} · {kind} · mở {r[3]} · chân {r[4]} · góp/kỳ {r[5]:,} VND · {r[8]}")
+        kind = "Tuần" if r[2] == 7 else "Tháng"
+        out.append(
+            f"#{r[0]} · {r[1]} · {kind} · mở {r[3]} · chân {r[4]} · góp/kỳ {r[5]:,} VND · {r[8]}"
+        )
     await upd.message.reply_text("\n".join(out))
 
 async def cmd_addpay(upd: Update, ctx: ContextTypes.DEFAULT_TYPE):
     try:
-        line_id = int(ctx.args[0]); dt = ctx.args[1]; amt = int(ctx.args[2])
-    except:
+        line_id = int(ctx.args[0])
+        dt = ctx.args[1]
+        amt = int(ctx.args[2])
+    except Exception:
         return await upd.message.reply_text("❌ Cú pháp: /addpay <line_id> <YYYY-MM-DD> <so_tien>")
     conn = db()
     row = conn.execute("SELECT status FROM lines WHERE id=?", (line_id,)).fetchone()
-    if not row: 
-        conn.close(); return await upd.message.reply_text("❌ Không tìm thấy dây.")
+    if not row:
+        conn.close()
+        return await upd.message.reply_text("❌ Không tìm thấy dây.")
     if row[0] != "OPEN":
-        conn.close(); return await upd.message.reply_text("⚠️ Dây đã đóng.")
+        conn.close()
+        return await upd.message.reply_text("⚠️ Dây đã đóng.")
     conn.execute("INSERT INTO payments(line_id,pay_date,amount) VALUES(?,?,?)", (line_id, dt, amt))
-    conn.commit(); conn.close()
+    conn.commit()
+    conn.close()
     await upd.message.reply_text(f"✅ Đã ghi đóng góp {amt:,} VND cho dây #{line_id} ({dt})")
 
-def load_line_full(line_id: int):
-    conn = db()
-    row = conn.execute("SELECT * FROM lines WHERE id=?", (line_id,)).fetchone()
-    if not row: conn.close(); return None, pd.DataFrame()
-    cols = ["id","name","period_days","start_date","legs","contrib","bid_type","bid_value","status","created_at"]
-    line = dict(zip(cols,row))
-    pays = pd.read_sql_query("SELECT pay_date, amount FROM payments WHERE line_id=? ORDER BY pay_date", conn, params=(line_id,))
-    conn.close()
-    return line, pays
-
 async def cmd_summary(upd: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    try: line_id = int(ctx.args[0])
-    except: return await upd.message.reply_text("❌ Cú pháp: /summary <line_id>")
+    try:
+        line_id = int(ctx.args[0])
+    except Exception:
+        return await upd.message.reply_text("❌ Cú pháp: /summary <line_id>")
     line, pays = load_line_full(line_id)
-    if not line: return await upd.message.reply_text("❌ Không tìm thấy dây.")
-    pool = calc_pool(line); disc = calc_discount(line); pay_now = payout(line)
+    if not line:
+        return await upd.message.reply_text("❌ Không tìm thấy dây.")
+    pool = calc_pool(line); pay_now = payout(line)
     total_paid = int(pays["amount"].sum()) if not pays.empty else 0
-    k_now = max(1, len(pays)+1)
+    k_now = max(1, min(len(pays) + 1, line["legs"]))
     pr, ro = compute_profit_for_k(line, k_now)
     bestk, bestp, bestroi = best_k(line, metric="roi")
     msg = [
@@ -208,51 +245,72 @@ async def cmd_summary(upd: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await upd.message.reply_text("\n".join(msg))
 
 async def cmd_whenhot(upd: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    if len(ctx.args)<1: return await upd.message.reply_text("❌ Cú pháp: /whenhot <line_id> [roi|lai]")
-    line_id = int(ctx.args[0]); metric = ctx.args[1].lower() if len(ctx.args)>=2 else "roi"
-    if metric not in ("roi","lai"): metric="roi"
+    if len(ctx.args) < 1:
+        return await upd.message.reply_text("❌ Cú pháp: /whenhot <line_id> [roi|lai]")
+    try:
+        line_id = int(ctx.args[0])
+    except Exception:
+        return await upd.message.reply_text("❌ line_id phải là số.")
+    metric = ctx.args[1].lower() if len(ctx.args) >= 2 else "roi"
+    if metric not in ("roi", "lai"):
+        metric = "roi"
     line, _ = load_line_full(line_id)
-    if not line: return await upd.message.reply_text("❌ Không tìm thấy dây.")
-    kbest, p, r = best_k(line, metric=metric)
+    if not line:
+        return await upd.message.reply_text("❌ Không tìm thấy dây.")
+    kbest, p, r = best_k(line, metric=("roi" if metric == "roi" else "lai"))
     await upd.message.reply_text(
-        f"🔎 Gợi ý theo {'ROI%' if metric=='roi' else 'Lãi'}:\n"
-        f"• Kỳ nên hốt: {kbest}\n• Ngày dự kiến: {k_date(line,kbest).date()}\n"
+        f"🔎 Gợi ý theo {'ROI%' if metric=='roi' else 'Lãi tuyệt đối'}:\n"
+        f"• Kỳ nên hốt: {kbest}\n"
+        f"• Ngày dự kiến: {k_date(line,kbest).date()}\n"
         f"• Tiền nhận hốt/kỳ: {int(round(payout(line))):,} VND\n"
-        f"• Lãi ước tính nếu hốt kỳ này: {int(round(p))):,} VND — ROI: {roi_to_str(r)}"
+        f"• Lãi ước tính nếu hốt kỳ này: {int(round(p)):,} VND — ROI: {roi_to_str(r)}"
     )
 
 async def cmd_close(upd: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    try: line_id = int(ctx.args[0])
-    except: return await upd.message.reply_text("❌ Cú pháp: /close <line_id>")
-    conn = db(); conn.execute("UPDATE lines SET status='CLOSED' WHERE id=?", (line_id,)); conn.commit(); conn.close()
+    try:
+        line_id = int(ctx.args[0])
+    except Exception:
+        return await upd.message.reply_text("❌ Cú pháp: /close <line_id>")
+    conn = db()
+    conn.execute("UPDATE lines SET status='CLOSED' WHERE id=?", (line_id,))
+    conn.commit()
+    conn.close()
     await upd.message.reply_text(f"🗂️ Đã đóng & lưu trữ dây #{line_id}.")
 
 # ----- Monthly auto-report -----
 async def send_monthly_report(ctx: ContextTypes.DEFAULT_TYPE):
-    cfg = load_cfg(); chat_id = cfg.get("report_chat_id")
-    if not chat_id: return
+    cfg = load_cfg()
+    chat_id = cfg.get("report_chat_id")
+    if not chat_id:
+        return
     today = datetime.now().date()
     if today.day != 1:  # chỉ gửi mùng 1
         return
     conn = db()
-    rows = conn.execute("SELECT id,name,period_days,start_date,legs,contrib,bid_type,bid_value,status FROM lines").fetchall()
+    rows = conn.execute(
+        "SELECT id,name,period_days,start_date,legs,contrib,bid_type,bid_value,status FROM lines"
+    ).fetchall()
     conn.close()
     if not rows:
         return await ctx.bot.send_message(chat_id=chat_id, text="📊 Báo cáo tháng: chưa có dây.")
     lines = []
     for r in rows:
-        line = {"id": r[0],"name": r[1],"period_days": r[2],"start_date": r[3],"legs": r[4],
-                "contrib": r[5],"bid_type": r[6],"bid_value": r[7],"status": r[8]}
-        pays = pd.DataFrame()  # nhẹ nhàng: chỉ lôi sum
+        line = {
+            "id": r[0], "name": r[1], "period_days": r[2], "start_date": r[3],
+            "legs": r[4], "contrib": r[5], "bid_type": r[6], "bid_value": r[7], "status": r[8]
+        }
         conn = db()
-        total_paid = conn.execute("SELECT COALESCE(SUM(amount),0) FROM payments WHERE line_id=?", (line["id"],)).fetchone()[0]
+        total_paid = conn.execute(
+            "SELECT COALESCE(SUM(amount),0) FROM payments WHERE line_id=?", (line["id"],)
+        ).fetchone()[0]
         conn.close()
-        k_now = max(1, (0 if total_paid==0 else 1))  # ước lượng đơn giản
+        k_now = max(1, 1 if total_paid > 0 else 1)
         pr, ro = compute_profit_for_k(line, k_now)
         bestk, bestp, bestroi = best_k(line, metric="roi")
         lines.append(
             f"#{line['id']} · {line['name']} · {('Tuần' if line['period_days']==7 else 'Tháng')} · "
-            f"góp/kỳ: {line['contrib']:,} · Lãi@k_now: {int(round(pr)):,} ({roi_to_str(ro)}) · Kỳ tối ưu: {bestk} ({roi_to_str(bestroi)})"
+            f"góp/kỳ: {line['contrib']:,} · Lãi@k_now: {int(round(pr)):,} ({roi_to_str(ro)}) · "
+            f"Kỳ tối ưu: {bestk} ({roi_to_str(bestroi)})"
         )
     txt = "📊 Báo cáo tháng:\n" + "\n".join(lines)
     await ctx.bot.send_message(chat_id=chat_id, text=txt)
@@ -260,7 +318,9 @@ async def send_monthly_report(ctx: ContextTypes.DEFAULT_TYPE):
 def schedule_jobs(app):
     now = datetime.now()
     first_run = datetime.combine(now.date(), dtime(hour=REPORT_HOUR))
-    if now > first_run: first_run += timedelta(days=1)
+    if now > first_run:
+        first_run += timedelta(days=1)
+    # PTB v20: first có thể là timedelta
     app.job_queue.run_repeating(send_monthly_report, interval=24*60*60, first=(first_run - now))
 
 def main():
@@ -275,7 +335,7 @@ def main():
     app.add_handler(CommandHandler("whenhot", cmd_whenhot))
     app.add_handler(CommandHandler("close", cmd_close))
     schedule_jobs(app)
-    print("✅ Hụi Bot (Railway) đang chạy...")
+    print("✅ Hụi Bot (Render) đang chạy...")
     app.run_polling()
 
 if __name__ == "__main__":
