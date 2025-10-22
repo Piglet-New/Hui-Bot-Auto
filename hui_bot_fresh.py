@@ -268,10 +268,38 @@ async def send_monthly_report_bot(app):
 
 # ---------- MAIN ----------
 async def _post_init(app):
-    # tạo task chạy nền báo cáo
+    # Mở HTTP keep-alive để Render pass port-scan
+    await start_keepalive_server()
+    # Bật vòng lặp báo cáo nền (không dùng JobQueue)
     asyncio.create_task(monthly_report_loop(app))
     print("🕒 Đã bật vòng lặp báo cáo nền (không dùng JobQueue).")
+    
+import asyncio, os
 
+async def start_keepalive_server():
+    """HTTP server tối giản để Render thấy cổng đang mở."""
+    port = int(os.getenv("PORT", "10000"))
+
+    async def handle_client(reader, writer):
+        try:
+            # Đọc request (bỏ nội dung)
+            await reader.read(1024)
+            # Trả về 200 OK siêu gọn
+            resp = b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nOK"
+            writer.write(resp)
+            await writer.drain()
+        finally:
+            writer.close()
+            try:
+                await writer.wait_closed()
+            except Exception:
+                pass
+
+    server = await asyncio.start_server(handle_client, host="0.0.0.0", port=port)
+    sockets = ", ".join(str(s.getsockname()) for s in (server.sockets or []))
+    print(f"🌐 Keep-alive HTTP on {sockets}")
+    return server
+    
 def main():
     init_db()
     app = ApplicationBuilder().token(TOKEN).post_init(_post_init).build()
