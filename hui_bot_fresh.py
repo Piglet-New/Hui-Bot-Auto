@@ -34,6 +34,30 @@ def to_iso_str(d: datetime) -> str:
 def to_user_str(d: datetime) -> str:
     return d.strftime(USER_DATE_FMT)
 
+# ----- MONEY PARSER -----
+def parse_money(text: str) -> int:
+    """
+    Chuyển '1tr'/'1000k'/'1000n' -> 1_000_000; '1k'/'1n' -> 1_000; '100k'/'100n' -> 100_000; hỗ trợ số thập phân.
+    Hỗ trợ thêm 'm'/'t' ~ triệu.
+    """
+    s = str(text).strip().lower().replace(",", "").replace("_", "").replace(" ", "")
+    if s.isdigit():
+        return int(s)
+    try:
+        if s.endswith("tr"):
+            num = float(s[:-2])
+            return int(num * 1_000_000)
+        elif s.endswith("k") or s.endswith("n"):
+            num = float(s[:-1])
+            return int(num * 1_000)
+        elif s.endswith("m") or s.endswith("t"):
+            num = float(s[:-1])
+            return int(num * 1_000_000)
+        else:
+            return int(float(s))
+    except Exception:
+        raise ValueError(f"Khong hieu gia tri tien: {text}")
+
 # ---------- DB ----------
 def db():
     conn = sqlite3.connect(DB_FILE)
@@ -188,10 +212,11 @@ async def cmd_start(upd: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "🌟 LENH CHINH (khong dau, ngay DD-MM-YYYY):\n\n"
         "1) Tao day:\n"
         "   /tao <ten> <tuan|thang> <DD-MM-YYYY> <so_chan> <menh_gia> <gia_san_%> <gia_tran_%> <dau_thao_%>\n"
-        "   Vi du: /tao Hui10tr tuan 10-10-2025 12 10000000 8 20 50\n\n"
+        "   Vi du: /tao Hui10tr tuan 10-10-2025 12 10000000 8 20 50\n"
+        "   💡 Tien co the viet: 5tr, 250k, 1n, 1000k, 2.5tr...\n\n"
         "2) Nhap tham ky:\n"
-        "   /tham <ma_day> <ky> <so_tien_tham_VND> [DD-MM-YYYY]\n"
-        "   Vi du: /tham 1 1 2000000 10-10-2025\n\n"
+        "   /tham <ma_day> <ky> <so_tien_tham> [DD-MM-YYYY]\n"
+        "   Vi du: /tham 1 1 2tr 10-10-2025\n\n"
         "3) Dat gio nhac rieng cho tung day:\n"
         "   /hen <ma_day> <HH:MM>\n"
         "   Vi du: /hen 1 07:45\n\n"
@@ -204,7 +229,7 @@ async def cmd_start(upd: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "6) Cai dat noi nhan bao cao thang (08:00 mùng 1):\n"
         "   /baocao [chat_id]\n"
         "   Vi du: /baocao   (gui ve chat hien tai)\n\n"
-        "💡 Meo: Den dung ngay mo ky, bot se nhac vui: “Tuan/Thang nay doan tham bao nhieu?”"
+        "💡 Den dung ngay mo ky, bot se nhac vui: “Tuan/Thang nay doan tham bao nhieu?”"
     )
     await upd.message.reply_text(msg)
 
@@ -231,7 +256,7 @@ async def cmd_new(upd: Update, ctx: ContextTypes.DEFAULT_TYPE):
         start_iso = to_iso_str(start_dt)
         period_days = 7 if kind.lower() in ["tuan","tuần","week","weekly"] else 30
         legs    = int(legs)
-        contrib = int(contrib)
+        contrib = parse_money(contrib)  # <<< dùng parser tiền rút gọn
         base_rate = float(base_rate)
         cap_rate  = float(cap_rate)
         thau_rate = float(thau_rate)
@@ -259,7 +284,7 @@ async def cmd_new(upd: Update, ctx: ContextTypes.DEFAULT_TYPE):
             f"Mo: {to_user_str(start_dt)} · Chan: {legs} · Menh gia: {contrib:,} VND\n"
             f"SAN: {base_rate:.2f}% · TRAN: {cap_rate:.2f}% · DAU THAO: {thau_rate:.2f}% tren M\n"
             f"⏰ Nhac mac dinh: 08:00 (dung /hen {line_id} HH:MM de doi)\n"
-            f"➡️ Nhap tham: /tham {line_id} <ky> <so_tien_tham_VND> [DD-MM-YYYY]"
+            f"➡️ Nhap tham: /tham {line_id} <ky> <so_tien_tham> [DD-MM-YYYY]"
         )
     except Exception as e:
         await upd.message.reply_text(
@@ -274,7 +299,7 @@ async def cmd_tham(upd: Update, ctx: ContextTypes.DEFAULT_TYPE):
     try:
         line_id = int(ctx.args[0])
         k       = int(ctx.args[1])
-        bid     = int(ctx.args[2])  # T_k (VND)
+        bid     = parse_money(ctx.args[2])  # <<< dùng parser tiền rút gọn
         rdate   = None
         if len(ctx.args) >= 4:
             rdate = to_iso_str(parse_user_date(ctx.args[3]))
@@ -506,7 +531,7 @@ async def send_periodic_reminders(app):
             f"• Ky {k_now}/{N} · Ngay: {to_user_str(parse_iso(start_date_str) + timedelta(days=(k_now-1)*int(period_days)))}\n"
             f"• Menh gia: {int(M):,} VND · SAN {float(base_rate):.1f}% ({min_bid:,}) · TRAN {float(cap_rate):.1f}% ({max_bid:,}) · THAO {float(thau_rate):.1f}% ({D:,})\n\n"
             f"➡️ {prompt}\n"
-            f"👉 Nhap: /tham {line_id} {k_now} <so_tien_tham_VND>"
+            f"👉 Nhap: /tham {line_id} {k_now} <so_tien_tham>"
         )
         await app.bot.send_message(chat_id=chat_id, text=txt)
 
