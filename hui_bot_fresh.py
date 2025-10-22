@@ -316,16 +316,30 @@ async def send_monthly_report(ctx: ContextTypes.DEFAULT_TYPE):
     await ctx.bot.send_message(chat_id=chat_id, text=txt)
 
 def schedule_jobs(app):
+    # chỉ chạy nếu có JobQueue
+    if not hasattr(app, "job_queue") or app.job_queue is None:
+        print("⚠️ JobQueue chưa được bật — bỏ qua lịch tự động.")
+        return
     now = datetime.now()
     first_run = datetime.combine(now.date(), dtime(hour=REPORT_HOUR))
     if now > first_run:
         first_run += timedelta(days=1)
-    # PTB v20: first có thể là timedelta
     app.job_queue.run_repeating(send_monthly_report, interval=24*60*60, first=(first_run - now))
+    print("🕒 Đã lên lịch gửi báo cáo hàng tháng.")
+
 
 def main():
     init_db()
-    app = ApplicationBuilder().token(TOKEN).build()
+    # ⚙️ Tạo bot kèm JobQueue
+    app = ApplicationBuilder().token(TOKEN).post_init(lambda app: print("Bot init xong")).build()
+    # 🔧 Bật JobQueue thủ công nếu cần
+    if not hasattr(app, "job_queue") or app.job_queue is None:
+        from telegram.ext import JobQueue
+        app.job_queue = JobQueue()
+        app.job_queue.set_application(app)
+        app.job_queue.start()
+        print("✅ JobQueue đã bật thủ công.")
+
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("setreport", cmd_setreport))
     app.add_handler(CommandHandler("new", cmd_new))
@@ -335,8 +349,10 @@ def main():
     app.add_handler(CommandHandler("whenhot", cmd_whenhot))
     app.add_handler(CommandHandler("close", cmd_close))
     schedule_jobs(app)
+
     print("✅ Hụi Bot (Render) đang chạy...")
     app.run_polling()
+
 
 if __name__ == "__main__":
     main()
