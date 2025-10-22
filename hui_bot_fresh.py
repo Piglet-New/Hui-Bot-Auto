@@ -394,7 +394,7 @@ async def daily_reminders(ctx: ContextTypes.DEFAULT_TYPE):
         style = "tuần" if pdays == 7 else "tháng"
         text = (
             f"⏰ Nhắc dây #{line_id} – {name} ({style})\n"
-            f"Đến giờ {at_hhmm} rồi — bạn đoán **thăm** bao nhiêu đây? 😉\n"
+            f"Đến giờ {at_hhmm} rồi — bạn đoán **thăm** bao nhiêu đây? 😉n"
             f"Gõ nhanh: `/tham {line_id} <ky> <so_tien_tham>`"
         )
         await ctx.bot.send_message(chat_id=chat_id, text=text, parse_mode="Markdown")
