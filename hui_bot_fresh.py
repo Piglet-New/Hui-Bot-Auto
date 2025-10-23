@@ -3,12 +3,12 @@
 # Dependencies: python-telegram-bot==20.3, pandas
 import os, sqlite3, json, asyncio, random, re, unicodedata
 from datetime import datetime, timedelta, time as dtime, date
-import pandas as pd
-from typing import Optional
+from typing import Optional, Callable, Dict, Tuple, List
 
-from telegram import Update
+import pandas as pd
+from telegram import Update, InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
 from telegram.ext import (
-    ApplicationBuilder, CommandHandler, ContextTypes, MessageHandler, filters
+    ApplicationBuilder, CommandHandler, ContextTypes, MessageHandler, CallbackQueryHandler, filters
 )
 
 # ========= CONFIG =========
@@ -31,8 +31,8 @@ def strip_accents(s: str) -> str:
 def parse_iso(s: str) -> datetime:
     return datetime.strptime(s, ISO_FMT)
 
-def _smart_parse_dmy(s: str) -> tuple[int,int,int]:
-    """Nhận '2-8-25', '2/8/25', '02-08-2025', ... → (d,m,y) với y 4 chữ số."""
+def _smart_parse_dmy(s: str) -> Tuple[int,int,int]:
+    """Nhận '2-8-25', '2/8/25', '02-08-2025', ... → (d,m,y) với y 4 chữ số (>=2000)."""
     s = s.strip().replace("/", "-")
     parts = s.split("-")
     if len(parts) != 3:
@@ -67,14 +67,11 @@ def parse_money(text: str) -> int:
         return int(s)
     try:
         if s.endswith("tr"):
-            num = float(s[:-2])
-            return int(num * 1_000_000)
-        elif s.endswith("k") or s.endswith("n"):
-            num = float(s[:-1])
-            return int(num * 1_000)
-        elif s.endswith("m") or s.endswith("t"):
-            num = float(s[:-1])
-            return int(num * 1_000_000)
+            num = float(s[:-2]);  return int(num * 1_000_000)
+        elif s.endswith(("k","n")):
+            num = float(s[:-1]);  return int(num * 1_000)
+        elif s.endswith(("m","t")):
+            num = float(s[:-1]);  return int(num * 1_000_000)
         else:
             return int(float(s))
     except Exception:
@@ -103,9 +100,9 @@ def init_db():
         base_rate REAL DEFAULT 0,                 -- % sàn trên M
         cap_rate  REAL DEFAULT 100,               -- % trần trên M
         thau_rate REAL DEFAULT 0,                 -- % đầu thảo trên M (trừ cố định mỗi kỳ)
-        remind_hour INTEGER DEFAULT 8,            -- giờ nhắc hẹn mỗi dây (0..23)
+        remind_hour INTEGER DEFAULT 8,            -- giờ nhắc (0..23)
         remind_min  INTEGER DEFAULT 0,            -- phút nhắc (0..59)
-        last_remind_iso TEXT                      -- YYYY-MM-DD của lần nhắc gần nhất (chống gửi trùng)
+        last_remind_iso TEXT                      -- YYYY-MM-DD (chống gửi trùng)
     )""")
     c.execute("""
     CREATE TABLE IF NOT EXISTS payments(
@@ -128,7 +125,6 @@ def init_db():
     conn.commit(); conn.close()
 
 def ensure_schema():
-    """Migration nhẹ khi DB đã có trước."""
     conn = db(); cur = conn.cursor()
     for col, decl in [
         ("base_rate", "REAL DEFAULT 0"),
@@ -138,18 +134,14 @@ def ensure_schema():
         ("remind_min",  "INTEGER DEFAULT 0"),
         ("last_remind_iso", "TEXT")
     ]:
-        try:
-            cur.execute(f"ALTER TABLE lines ADD COLUMN {col} {decl}")
-        except Exception:
-            pass
+        try: cur.execute(f"ALTER TABLE lines ADD COLUMN {col} {decl}")
+        except Exception: pass
     conn.commit(); conn.close()
 
 def load_cfg():
     if os.path.exists(CONFIG_FILE):
-        try:
-            return json.load(open(CONFIG_FILE, "r", encoding="utf-8"))
-        except Exception:
-            return {}
+        try: return json.load(open(CONFIG_FILE, "r", encoding="utf-8"))
+        except Exception: return {}
     return {}
 
 def save_cfg(cfg: dict):
@@ -157,7 +149,6 @@ def save_cfg(cfg: dict):
 
 # ---------- Helpers & Tính toán ----------
 def k_date(line, k: int) -> datetime:
-    """Ngày của kỳ k (k>=1)."""
     return parse_iso(line["start_date"]) + timedelta(days=(k-1)*int(line["period_days"]))
 
 def roi_to_str(r: float) -> str:
@@ -172,8 +163,6 @@ def get_bids(line_id: int):
 def payout_at_k(line, bids: dict, k: int) -> int:
     """
     Payout_k = (k-1)*M + (N - k)*(M - T_k) - D
-      M = mệnh giá, N = số chân, T_k = thăm thực tế kỳ k
-      D = thau_rate% * M (đầu thảo cố định theo mệnh giá, trừ mỗi kỳ)
     """
     M, N = int(line["contrib"]), int(line["legs"])
     T_k = int(bids.get(k, 0))
@@ -259,7 +248,7 @@ def help_text() -> str:
 """
 
 # --------- SESSIONS cho wizard ---------
-SESS = {}  # {chat_id: {"mode": "...", "expect": [...], "data": {}, "cmd": "..."}} 
+SESS: Dict[int, dict] = {}
 
 def start_session(chat_id: int, mode: str, expect_keys: list, cmd: str):
     SESS[chat_id] = {"mode": mode, "expect": expect_keys, "data": {}, "cmd": cmd}
@@ -268,12 +257,6 @@ def end_session(chat_id: int):
     if chat_id in SESS: del SESS[chat_id]
 
 def parse_pack_reply(text: str, expect_keys: list) -> dict:
-    """
-    Nhận 1 tin nhắn, chấp nhận:
-      - Nhiều dòng: mỗi dòng là một giá trị theo đúng thứ tự expect_keys
-      - Một dòng dùng dấu | hoặc ; để ngăn cách
-      - key=value
-    """
     res = {}
     s = (text or "").strip()
     # key=value
@@ -306,18 +289,65 @@ def parse_pack_reply(text: str, expect_keys: list) -> dict:
 
 # ---------- COMMANDS ----------
 async def cmd_lenh(upd: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    await upd.message.reply_text(help_text(), parse_mode="Markdown", disable_web_page_preview=True)
+    # Nút bấm thực thi ngay (callback) thay vì chỉ copy text
+    kb = [
+        [InlineKeyboardButton("🧩 Tạo dây (wizard)", callback_data="wiz:tao")],
+        [InlineKeyboardButton("💰 Nhập thăm (wizard)", callback_data="wiz:tham")],
+        [InlineKeyboardButton("⏰ Đặt giờ nhắc (wizard)", callback_data="wiz:hen")],
+        [InlineKeyboardButton("📋 Danh sách dây", callback_data="show:danhsach")],
+        [InlineKeyboardButton("📊 Tóm tắt dây", callback_data="ask:tomtat")],
+        [InlineKeyboardButton("💡 Gợi ý hốt (Roi%|Lãi)", callback_data="ask:hottot")],
+    ]
+    await upd.message.reply_text(
+        help_text(),
+        parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup(kb),
+        disable_web_page_preview=True
+    )
+
+async def on_menu_callback(cbq: CallbackQuery, ctx: ContextTypes.DEFAULT_TYPE):
+    data = cbq.data or ""
+    chat_id = cbq.message.chat_id
+    await cbq.answer()
+    if data == "wiz:tao":
+        expect = ["ten","chu_ky","ngay","sochan","menhgia","san","tran","thau"]
+        start_session(chat_id, "tao", expect, "/tao")
+        txt = (
+            "🧩 **Điền nhanh tạo dây** – trả lời **một tin** theo thứ tự (mỗi dòng hoặc `|`):\n"
+            "1) Tên dây\n2) Chu kỳ: `tuan`/`thang`\n3) Ngày mở DD-MM-YYYY\n4) Số chân\n"
+            "5) Mệnh giá (vd: 10tr, 2500k)\n6) Sàn %\n7) Trần %\n8) Đầu thảo %\n\n"
+            "VD:\n`Hui10tr | tuan | 10-10-2025 | 12 | 10tr | 8 | 20 | 50`\n"
+            "🚫 Thoát wizard: /huy"
+        )
+        await cbq.message.reply_text(txt, parse_mode="Markdown")
+    elif data == "wiz:tham":
+        start_session(chat_id, "tham", ["maday","ky","sotientham","ngay"], "/tham")
+        txt = (
+            "🧩 **Nhập thăm nhanh** – trả lời **một tin** theo thứ tự (mỗi dòng hoặc `|`):\n"
+            "1) Mã dây · 2) Kỳ · 3) Số tiền thăm · 4) Ngày DD-MM-YYYY (trống = hôm nay)\n"
+            "VD: `1 | 3 | 2tr | 10-10-2025`\n"
+            "🚫 Thoát: /huy"
+        )
+        await cbq.message.reply_text(txt, parse_mode="Markdown")
+    elif data == "wiz:hen":
+        await cbq.message.reply_text("Cú pháp: `/hen <mã_dây> <HH:MM>` (VD: `/hen 1 07:45`)", parse_mode="Markdown")
+    elif data == "show:danhsach":
+        # gọi trực tiếp
+        upd = Update(update_id=0, message=cbq.message)  # reuse
+        await cmd_list(upd, ctx)
+    elif data == "ask:tomtat":
+        await cbq.message.reply_text("Nhập: `/tomtat <mã_dây>`", parse_mode="Markdown")
+    elif data == "ask:hottot":
+        await cbq.message.reply_text("Nhập: `/hottot <mã_dây> [Roi%|Lãi]`", parse_mode="Markdown")
 
 async def cmd_start(upd: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    await upd.message.reply_text(help_text(), parse_mode="Markdown", disable_web_page_preview=True)
+    await cmd_lenh(upd, ctx)
 
 async def cmd_setreport(upd: Update, ctx: ContextTypes.DEFAULT_TYPE):
     cfg = load_cfg()
     if ctx.args:
-        try:
-            cid = int(ctx.args[0])
-        except Exception:
-            return await upd.message.reply_text("❌ `chat_id` không hợp lệ.")
+        try: cid = int(ctx.args[0])
+        except Exception: return await upd.message.reply_text("❌ `chat_id` không hợp lệ.")
     else:
         cid = upd.effective_chat.id
     cfg["report_chat_id"] = cid
@@ -336,18 +366,10 @@ async def cmd_new(upd: Update, ctx: ContextTypes.DEFAULT_TYPE):
         expect = ["ten","chu_ky","ngay","sochan","menhgia","san","tran","thau"]
         start_session(chat_id, "tao", expect, "/tao")
         form = (
-            "🧩 **Điền nhanh tạo dây** – hãy trả lời **một tin duy nhất** gồm các dòng (hoặc dùng dấu `|`) theo thứ tự:\n"
-            "1) Tên dây (vd: Hui10tr)\n"
-            "2) Chu kỳ: `tuan` hoặc `thang`\n"
-            "3) Ngày mở (DD-MM-YYYY), vd: 10-10-2025\n"
-            "4) Số chân (vd: 12)\n"
-            "5) Mệnh giá M (vd: 10tr, 2500k, 2.5tr)\n"
-            "6) Giá **sàn %** (vd: 8)\n"
-            "7) Giá **trần %** (vd: 20)\n"
-            "8) **Đầu thảo %** (vd: 50)\n\n"
-            "Ví dụ (nhiều dòng):\n"
-            "`Hui10tr`\n`tuan`\n`10-10-2025`\n`12`\n`10tr`\n`8`\n`20`\n`50`\n\n"
-            "Hoặc một dòng: `Hui10tr | tuan | 10-10-2025 | 12 | 10tr | 8 | 20 | 50`\n"
+            "🧩 **Điền nhanh tạo dây** – trả lời **một tin** theo thứ tự (mỗi dòng hoặc `|`):\n"
+            "1) Tên dây\n2) Chu kỳ: `tuan`/`thang`\n3) Ngày mở DD-MM-YYYY\n4) Số chân\n"
+            "5) Mệnh giá (vd: 10tr, 2500k)\n6) Sàn %\n7) Trần %\n8) Đầu thảo %\n\n"
+            "VD:\n`Hui10tr | tuan | 10-10-2025 | 12 | 10tr | 8 | 20 | 50`\n"
             "🚫 Thoát wizard: /huy"
         )
         await upd.message.reply_text(form, parse_mode="Markdown")
@@ -582,7 +604,7 @@ async def send_monthly_report_bot(app):
     txt = "📊 **Báo cáo tháng**:\n" + "\n".join(lines)
     await app.bot.send_message(chat_id=chat_id, text=txt, parse_mode="Markdown")
 
-# ----- NHẮC HẸN DÍ DỎM THEO KỲ -----
+# ----- NHẮC HẸN -----
 async def send_periodic_reminders(app):
     cfg = load_cfg(); chat_id = cfg.get("report_chat_id")
     if not chat_id: return
@@ -647,9 +669,8 @@ async def send_periodic_reminders(app):
         conn2.execute("UPDATE lines SET last_remind_iso=? WHERE id=?", (now_d.isoformat(), line_id))
         conn2.commit(); conn2.close()
 
-# ----- VÒNG LẶP NỀN -----
+# ----- VÒNG LẶP NỀN & KEEPALIVE -----
 async def monthly_report_loop(app):
-    """Mỗi ngày chờ đến REPORT_HOUR rồi gửi báo cáo tháng (nếu mùng 1)."""
     while True:
         now = datetime.now()
         target = datetime.combine(now.date(), dtime(hour=REPORT_HOUR))
@@ -659,12 +680,10 @@ async def monthly_report_loop(app):
         await send_monthly_report_bot(app)
 
 async def reminder_loop(app):
-    """Mỗi phút check nhắc hẹn cho từng dây theo giờ cấu hình."""
     while True:
         await send_periodic_reminders(app)
         await asyncio.sleep(REMINDER_TICK_SECONDS)
 
-# ----- HTTP keep-alive cho Render -----
 async def start_keepalive_server():
     port = int(os.getenv("PORT", "10000"))
     async def handle_client(reader, writer):
@@ -698,9 +717,7 @@ async def handle_text(upd: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if chat_id not in SESS:
         return
     sess = SESS[chat_id]
-    mode = sess["mode"]
-    expect = sess["expect"]
-    data = sess["data"]
+    mode = sess["mode"]; expect = sess["expect"]; data = sess["data"]
 
     filled = parse_pack_reply(upd.message.text or "", expect)
     data.update(filled)
@@ -723,14 +740,8 @@ async def handle_text(upd: Update, ctx: ContextTypes.DEFAULT_TYPE):
         if mode == "tao":
             await _create_line_and_reply(
                 upd,
-                data["ten"],
-                data["chu_ky"],
-                data["ngay"],
-                data["sochan"],
-                data["menhgia"],
-                data["san"],
-                data["tran"],
-                data["thau"],
+                data["ten"], data["chu_ky"], data["ngay"], data["sochan"],
+                data["menhgia"], data["san"], data["tran"], data["thau"],
             )
         elif mode == "tham":
             rdate = None
@@ -738,8 +749,7 @@ async def handle_text(upd: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 rdate = to_iso_str(parse_user_date(data["ngay"]))
             await _save_tham(
                 upd,
-                int(data["maday"]),
-                int(data["ky"]),
+                int(data["maday"]), int(data["ky"]),
                 parse_money(data["sotientham"]),
                 rdate
             )
@@ -747,28 +757,84 @@ async def handle_text(upd: Update, ctx: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         await upd.message.reply_text(f"❌ Lỗi xử lý: {e}")
 
+# ---------- LỆNH CHUẨN + CHỐNG GÕ LỆCH ----------
+CANONICAL: Dict[str, Callable[[Update, ContextTypes.DEFAULT_TYPE], None]] = {}
+
+def register_command(name: str, func: Callable):
+    CANONICAL[name] = func
+
+def edit_distance_leq1(a: str, b: str) -> bool:
+    """Kiểm tra khoảng cách chỉnh sửa (Levenshtein) <=1 — đủ cho gõ lệch nhẹ."""
+    if a == b: return True
+    if abs(len(a)-len(b)) > 1: return False
+    # ensure a is shorter
+    if len(a) > len(b): a, b = b, a
+    i = j = diff = 0
+    while i < len(a) and j < len(b):
+        if a[i] == b[j]:
+            i += 1; j += 1
+        else:
+            diff += 1
+            if diff > 1: return False
+            if len(a) == len(b):
+                i += 1; j += 1  # substitution
+            else:
+                j += 1          # insertion into a (or deletion from b)
+    # leftover
+    if j < len(b) or i < len(a):
+        diff += 1
+    return diff <= 1
+
+async def unknown_command(upd: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Bắt lệnh có dấu/nhầm ký tự -> map về lệnh chuẩn và gọi luôn."""
+    text = upd.message.text or ""
+    if not text.startswith("/"): return
+    parts = text.split()
+    raw_cmd = parts[0][1:].lower()
+    args = parts[1:]
+    base = strip_accents(raw_cmd)
+
+    # tìm match tốt nhất
+    best = None
+    for canon in CANONICAL.keys():
+        if base == canon or edit_distance_leq1(base, canon):
+            best = canon; break
+    if not best:
+        return await upd.message.reply_text("❓ Lệnh không hỗ trợ. Gõ /lenh để xem hướng dẫn.")
+
+    # gán args và gọi hàm đích
+    setattr(ctx, "args", args)
+    await CANONICAL[best](upd, ctx)
+
 # ---------- MAIN ----------
 def main():
-    init_db()
-    ensure_schema()
+    init_db(); ensure_schema()
 
     app = ApplicationBuilder().token(TOKEN).post_init(_post_init).build()
 
-    app.add_handler(CommandHandler("start",    cmd_start))
-    app.add_handler(CommandHandler("lenh",     cmd_lenh))
-    app.add_handler(CommandHandler("baocao",   cmd_setreport))
-    app.add_handler(CommandHandler("tao",      cmd_new))
-    app.add_handler(CommandHandler("tham",     cmd_tham))
-    app.add_handler(CommandHandler("hen",      cmd_set_remind))
-    app.add_handler(CommandHandler("danhsach", cmd_list))
-    app.add_handler(CommandHandler("tomtat",   cmd_summary))
-    app.add_handler(CommandHandler("hottot",   cmd_whenhot))  # ✅ chỉ còn /hottot
-    app.add_handler(CommandHandler("dong",     cmd_close))
-    app.add_handler(CommandHandler("huy",      cmd_cancel))
+    # Đăng ký lệnh + map canonical
+    app.add_handler(CommandHandler("start",    cmd_start));   register_command("start", cmd_start)
+    app.add_handler(CommandHandler("lenh",     cmd_lenh));    register_command("lenh", cmd_lenh)
+    app.add_handler(CommandHandler("baocao",   cmd_setreport)); register_command("baocao", cmd_setreport)
+    app.add_handler(CommandHandler("tao",      cmd_new));     register_command("tao", cmd_new)
+    app.add_handler(CommandHandler("tham",     cmd_tham));    register_command("tham", cmd_tham)
+    app.add_handler(CommandHandler("hen",      cmd_set_remind)); register_command("hen", cmd_set_remind)
+    app.add_handler(CommandHandler("danhsach", cmd_list));    register_command("danhsach", cmd_list)
+    app.add_handler(CommandHandler("tomtat",   cmd_summary)); register_command("tomtat", cmd_summary)
+    app.add_handler(CommandHandler("hottot",   cmd_whenhot)); register_command("hottot", cmd_whenhot)
+    app.add_handler(CommandHandler("dong",     cmd_close));   register_command("dong", cmd_close)
+    app.add_handler(CommandHandler("huy",      cmd_cancel));  register_command("huy", cmd_cancel)
 
+    # Callback từ menu /lenh
+    app.add_handler(CallbackQueryHandler(on_menu_callback))
+
+    # Bắt mọi lệnh còn lại (có dấu/nhầm) → normalize & dispatch
+    app.add_handler(MessageHandler(filters.COMMAND, unknown_command))
+
+    # Wizard text
     app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), handle_text))
 
-    print("✅ Hui Bot (Render) đang chạy...")
+    print("✅ Hui Bot đang chạy...")
     app.run_polling()
 
 if __name__ == "__main__":
