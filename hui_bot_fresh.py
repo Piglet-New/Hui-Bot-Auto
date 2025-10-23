@@ -4,7 +4,10 @@ import os, sqlite3, json, asyncio, random, re
 from datetime import datetime, timedelta, time as dtime, date
 import pandas as pd
 from telegram import Update
-from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes, MessageHandler, filters
+from telegram.ext import (
+    ApplicationBuilder, CommandHandler, ContextTypes,
+    MessageHandler, filters
+)
 
 # ========= CONFIG =========
 TOKEN = (os.getenv("TELEGRAM_TOKEN") or os.getenv("BOT_TOKEN") or "").strip()
@@ -14,8 +17,8 @@ if not TOKEN:
 DB_FILE = "hui.db"
 CONFIG_FILE = "config.json"
 
-REPORT_HOUR = 8                 # 08:00 gửi báo cáo tháng (chỉ mùng 1)
-REMINDER_TICK_SECONDS = 60      # vòng lặp check nhắc hẹn
+REPORT_HOUR = 8                   # 08:00 gửi báo cáo tháng (chỉ mùng 1)
+REMINDER_TICK_SECONDS = 60        # vòng lặp check nhắc hẹn
 # =========================
 
 # ====== DATE HELPERS ======
@@ -26,7 +29,7 @@ def parse_iso(s: str) -> datetime:
     return datetime.strptime(s, ISO_FMT)
 
 def parse_user_date(s: str) -> datetime:
-    return datetime.strptime(s.strip(), USER_DATE_FMT)
+    return datetime.strptime(s, USER_DATE_FMT)
 
 def to_iso_str(d: datetime) -> str:
     return d.strftime(ISO_FMT)
@@ -37,24 +40,24 @@ def to_user_str(d: datetime) -> str:
 # ----- MONEY PARSER -----
 def parse_money(text: str) -> int:
     """
-    '1tr'/'1000k'/'1000n' -> 1_000_000; '1k'/'1n' -> 1_000; '100k'/'100n' -> 100_000; hỗ trợ số thập phân.
-    Hỗ trợ thêm 'm'/'t' ~ triệu. Cho phép viết có dấu chấm, phẩy.
+    Chuyển '1tr'/'2.5tr'/'1000k'/'1000n' -> 1_000_000; '1k'/'1n' -> 1_000; '100k'/'100n' -> 100_000.
+    Hỗ trợ số thuần, dấu chấm, 'm'/'t' ~ triệu.
     """
-    s = str(text).strip().lower().replace(",", "").replace("_", "").replace(" ", "").replace(".", "")
+    s = str(text).strip().lower().replace(",", "").replace("_", "").replace(" ", "")
     if s.isdigit():
         return int(s)
     try:
         if s.endswith("tr"):
             num = float(s[:-2])
             return int(num * 1_000_000)
-        elif s.endswith("k") or s.endswith("n"):
+        elif s.endswith(("k","n")):
             num = float(s[:-1])
             return int(num * 1_000)
-        elif s.endswith("m") or s.endswith("t"):
+        elif s.endswith(("m","t")):
             num = float(s[:-1])
             return int(num * 1_000_000)
-        else:
-            return int(float(s))
+        # fallback số thập phân
+        return int(float(s))
     except Exception:
         raise ValueError(f"Không hiểu giá trị tiền: {text}")
 
@@ -80,10 +83,10 @@ def init_db():
         created_at TEXT NOT NULL,
         base_rate REAL DEFAULT 0,                 -- % sàn trên M
         cap_rate  REAL DEFAULT 100,               -- % trần trên M
-        thau_rate REAL DEFAULT 0,                 -- % đầu thảo trên M (trừ cố định mỗi kỳ)
-        remind_hour INTEGER DEFAULT 8,            -- giờ nhắc hẹn mỗi dây (0..23)
+        thau_rate REAL DEFAULT 0,                 -- % đầu thảo trên M (trừ mỗi kỳ)
+        remind_hour INTEGER DEFAULT 8,            -- giờ nhắc (0..23)
         remind_min  INTEGER DEFAULT 0,            -- phút nhắc (0..59)
-        last_remind_iso TEXT                      -- YYYY-MM-DD của lần nhắc gần nhất (chống gửi trùng)
+        last_remind_iso TEXT                      -- YYYY-MM-DD đã nhắc hôm nay?
     )""")
     c.execute("""
     CREATE TABLE IF NOT EXISTS payments(
@@ -205,86 +208,175 @@ def load_line_full(line_id: int):
     conn.close()
     return line, pays
 
-# ============= HELP TEXT (có dấu) =============
-def help_text() -> str:
-    return (
-        "👋 **HỦI BOT – phiên bản SQLite (không cần Google Sheets)**\n\n"
-        "🌟 **LỆNH CHÍNH** (không dấu, ngày **DD-MM-YYYY**):\n\n"
-        "1) Tạo dây (đủ tham số):\n"
-        "   `/tao <tên> <tuần|tháng> <DD-MM-YYYY> <số_chân> <mệnh_giá> <sàn_%> <trần_%> <thầu_%>`\n"
-        "   Ví dụ: `/tao Hui10tr tuần 10-10-2025 12 10tr 8 20 50`\n"
-        "   💡 Thiếu tham số? Gõ **/tao** trống, bot sẽ gửi **một biểu mẫu** để bạn điền 1 lần là xong.\n\n"
-        "2) Nhập thăm kỳ:\n"
-        "   `/tham <mã_dây> <kỳ> <số_tiền_thăm> [DD-MM-YYYY]`\n"
-        "   Ví dụ: `/tham 1 1 2tr 10-10-2025`\n\n"
-        "3) Đặt giờ nhắc riêng:\n"
-        "   `/hen <mã_dây> <HH:MM>`  (ví dụ: `/hen 1 07:45`)\n\n"
-        "4) Danh sách / Tóm tắt / Gợi ý hốt:\n"
-        "   `/danhsach`\n"
-        "   `/tomtat <mã_dây>`\n"
-        "   `/hoitot <mã_dây> [roi|lai]`\n\n"
-        "5) Đóng dây: `/dong <mã_dây>`\n\n"
-        "6) Cài nơi nhận báo cáo & nhắc (gửi vào chat hiện tại nếu không nhập):\n"
-        "   `/baocao [chat_id]`\n\n"
-        "📜 Gõ `/lenh` bất cứ lúc nào để hiện lại danh sách lệnh."
-    )
+# ================== WIZARD /TAO ==================
+# Lưu trạng thái theo user_id
+TAO_WIZ = {}  # user_id -> {"step": int, "data": dict}
 
-# --------- SESSIONS cho wizard (theo chat) ---------
-SESS = {}  # {chat_id: {"mode": "...", "expect": [...], "data": {}, "cmd": "..."}}
+TAO_ORDER = ["name","kind","start","legs","contrib","base_rate","cap_rate","thau_rate"]
 
-def start_session(chat_id: int, mode: str, expect_keys: list, cmd: str):
-    SESS[chat_id] = {"mode": mode, "expect": expect_keys, "data": {}, "cmd": cmd}
+def _is_week_token(s: str) -> bool:
+    return s.strip().lower() in ("tuan","tuần","week","weekly")
 
-def end_session(chat_id: int):
-    if chat_id in SESS: del SESS[chat_id]
+def _ask_for(step: str) -> str:
+    if step == "name":
+        return "Tên dây hụi là gì? (ví dụ: Hui10tr)"
+    if step == "kind":
+        return "Hụi **tuần** hay **tháng**? (gõ: tuan/thang)"
+    if step == "start":
+        return "Ngày mở dây? Nhập theo dạng **DD-MM-YYYY** (ví dụ: 10-10-2025)."
+    if step == "legs":
+        return "Số **chân** (số phần): (ví dụ: 12)"
+    if step == "contrib":
+        return "Mệnh giá mỗi kỳ (**M**): (ví dụ: 10tr, 2500k, 2.5tr)"
+    if step == "base_rate":
+        return "Giá **sàn %** (ví dụ: 8)."
+    if step == "cap_rate":
+        return "Giá **trần %** (ví dụ: 20)."
+    if step == "thau_rate":
+        return "Đầu **thảo %** tính trên M (ví dụ: 50)."
+    return "..."
 
-def parse_pack_reply(text: str, expect_keys: list) -> dict:
-    """
-    Nhận 1 tin nhắn, chấp nhận:
-      - Nhiều dòng: mỗi dòng là một giá trị theo đúng thứ tự expect_keys
-      - Một dòng dùng dấu | hoặc ; để ngăn cách
-      - key=value (nếu người dùng thích gõ dạng này)
-    Trả về dict {key: value} (có thể thiếu).
-    """
-    res = {}
-    s = text.strip()
-    # Thử key=value
-    if "=" in s:
-        for part in re.split(r"[|\n;]+", s):
-            part = part.strip()
-            if "=" in part:
-                k, v = part.split("=", 1)
-                k = k.strip().lower()
-                v = v.strip()
-                # map alias
-                alias = {
-                    "ten": "ten",
-                    "tuan": "chu_ky", "thang": "chu_ky", "chu_ky": "chu_ky",
-                    "ngay": "ngay",
-                    "sochan": "sochan", "chan": "sochan", "so_chans": "sochan",
-                    "menhgia": "menhgia", "menh_gia": "menhgia",
-                    "san": "san", "tran": "tran", "thau": "thau",
-                    "maday": "maday", "ky": "ky", "sotientham": "sotientham", "sotien": "sotientham",
-                    "gio": "gio"
-                }
-                key = alias.get(k, k)
-                if key in expect_keys:
-                    res[key] = v
-        return res
+async def _wizard_begin(user_id: int, upd: Update):
+    TAO_WIZ[user_id] = {"step": 0, "data": {}}
+    await upd.message.reply_text("🔧 Chế độ tạo dây theo từng bước.\nBạn có thể gõ **/huy** để thoát bất kỳ lúc nào.")
+    await upd.message.reply_text(_ask_for(TAO_ORDER[0]))
 
-    # Không phải key=value: cắt theo dòng hoặc theo |
-    parts = [p for p in re.split(r"[|\n]+", s) if p.strip() != ""]
-    for i, key in enumerate(expect_keys):
-        if i < len(parts):
-            res[key] = parts[i].strip()
-    return res
+async def _wizard_abort(user_id: int, upd: Update):
+    if TAO_WIZ.pop(user_id, None) is not None:
+        await upd.message.reply_text("⛔ Đã huỷ tạo dây.")
+
+async def _wizard_commit(user_id: int, upd: Update):
+    info = TAO_WIZ.pop(user_id, None)
+    if not info:
+        return
+    d = info["data"]
+    try:
+        name = d["name"]
+        kind = d["kind"]
+        start_user = d["start"]
+        _ = parse_user_date(start_user)  # validate
+        period_days = 7 if _is_week_token(kind) else 30
+        legs = int(d["legs"])
+        contrib = parse_money(d["contrib"])
+        base_rate = float(d["base_rate"])
+        cap_rate  = float(d["cap_rate"])
+        thau_rate = float(d["thau_rate"])
+        if not (0 <= base_rate <= cap_rate <= 100):
+            return await upd.message.reply_text("❌ Giá sàn <= giá trần và nằm trong [0..100].")
+        if not (0 <= thau_rate <= 100):
+            return await upd.message.reply_text("❌ Đầu thảo % phải trong [0..100].")
+
+        conn = db()
+        conn.execute(
+            """INSERT INTO lines(name,period_days,start_date,legs,contrib,
+                                 bid_type,bid_value,status,created_at,
+                                 base_rate,cap_rate,thau_rate,remind_hour,remind_min,last_remind_iso)
+               VALUES(?,?,?,?,?,'dynamic',0,'OPEN',?, ?, ?, ?, 8, 0, NULL)""",
+            (name, period_days, to_iso_str(parse_user_date(start_user)), legs, contrib,
+             datetime.now().isoformat(), base_rate, cap_rate, thau_rate)
+        )
+        conn.commit()
+        line_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+        conn.close()
+
+        await upd.message.reply_text(
+            f"✅ Đã tạo dây #{line_id} ({name}) — {'Hụi tuần' if period_days==7 else 'Hụi tháng'}\n"
+            f"Mở: {start_user} · Chân: {legs} · Mệnh giá: {contrib:,} VND\n"
+            f"SÀN {base_rate:.2f}% · TRẦN {cap_rate:.2f}% · THẢO {thau_rate:.2f}% (trên M)"
+        )
+    except Exception as e:
+        await upd.message.reply_text(f"❌ Lỗi tạo dây: {e}")
+
+async def _wizard_on_text(upd: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    user_id = upd.effective_user.id if upd.effective_user else None
+    if user_id is None:  # không xác định user
+        return
+    state = TAO_WIZ.get(user_id)
+    if not state:  # không ở chế độ wizard
+        return
+    step_idx = state["step"]
+    step = TAO_ORDER[step_idx]
+    txt = (upd.message.text or "").strip()
+
+    # validate & save từng bước
+    try:
+        if step == "name":
+            if not txt:
+                raise ValueError("Tên không được rỗng.")
+            state["data"]["name"] = txt
+
+        elif step == "kind":
+            if not _is_week_token(txt) and txt.lower() != "thang":
+                raise ValueError("Chỉ nhận 'tuan' hoặc 'thang'.")
+            state["data"]["kind"] = txt.lower()
+
+        elif step == "start":
+            parse_user_date(txt)  # validate
+            state["data"]["start"] = txt
+
+        elif step == "legs":
+            legs = int(txt)
+            if legs <= 0:
+                raise ValueError("Số chân phải > 0.")
+            state["data"]["legs"] = legs
+
+        elif step == "contrib":
+            money = parse_money(txt)
+            if money <= 0:
+                raise ValueError("Mệnh giá phải > 0.")
+            state["data"]["contrib"] = money
+
+        elif step == "base_rate":
+            state["data"]["base_rate"] = float(txt)
+
+        elif step == "cap_rate":
+            cap = float(txt)
+            if cap < float(state["data"].get("base_rate", 0)):
+                raise ValueError("Giá trần phải >= giá sàn.")
+            state["data"]["cap_rate"] = cap
+
+        elif step == "thau_rate":
+            state["data"]["thau_rate"] = float(txt)
+
+        # chuyển bước
+        state["step"] += 1
+        if state["step"] >= len(TAO_ORDER):
+            return await _wizard_commit(user_id, upd)
+        await upd.message.reply_text(_ask_for(TAO_ORDER[state["step"]]))
+    except Exception as e:
+        await upd.message.reply_text(f"⚠️ {e}\n• { _ask_for(step) }")
 
 # ---------- COMMANDS ----------
-async def cmd_lenh(upd: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    await upd.message.reply_text(help_text(), parse_mode="Markdown", disable_web_page_preview=True)
-
 async def cmd_start(upd: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    await upd.message.reply_text(help_text(), parse_mode="Markdown", disable_web_page_preview=True)
+    msg = (
+        "👋 HỤI BOT – phiên bản SQLite (không cần Google Sheets)\n\n"
+        "🌟 LỆNH CHÍNH (không dấu, ngày DD-MM-YYYY):\n\n"
+        "1) Tạo dây (đủ tham số):\n"
+        "   /tao <ten> <tuan|thang> <DD-MM-YYYY> <so_chan> <menh_gia> <gia_san_%> <gia_tran_%> <dau_thao_%>\n"
+        "   Ví dụ: /tao Hui10tr tuan 10-10-2025 12 10000000 8 20 50\n"
+        "   💡 Thiếu tham số? Chỉ gõ /tao rồi trả lời từng câu hỏi.\n\n"
+        "2) Nhập thăm kỳ:\n"
+        "   /tham <ma_day> <ky> <so_tien_tham> [DD-MM-YYYY]\n"
+        "   Ví dụ: /tham 1 1 2tr 10-10-2025\n\n"
+        "3) Đặt giờ nhắc riêng:\n"
+        "   /hen <ma_day> <HH:MM>  (ví dụ: /hen 1 07:45)\n\n"
+        "4) Danh sách / Tóm tắt / Gợi ý hốt:\n"
+        "   /danhsach\n"
+        "   /tomtat <ma_day>\n"
+        "   /hoitot <ma_day> [roi|lai]\n\n"
+        "5) Đóng dây:\n"
+        "   /dong <ma_day>\n\n"
+        "6) Cài nơi nhận báo cáo & nhắc (gửi vào chat hiện tại nếu không nhập):\n"
+        "   /baocao [chat_id]\n\n"
+        "🆘 Lệnh huỷ wizard: /huy"
+    )
+    await upd.message.reply_text(msg)
+
+async def cmd_huy(upd: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    user_id = upd.effective_user.id if upd.effective_user else None
+    if user_id is None:
+        return
+    await _wizard_abort(user_id, upd)
 
 async def cmd_setreport(upd: Update, ctx: ContextTypes.DEFAULT_TYPE):
     cfg = load_cfg()
@@ -292,114 +384,79 @@ async def cmd_setreport(upd: Update, ctx: ContextTypes.DEFAULT_TYPE):
         try:
             cid = int(ctx.args[0])
         except Exception:
-            return await upd.message.reply_text("❌ `chat_id` không hợp lệ.")
+            return await upd.message.reply_text("❌ chat_id không hợp lệ.")
     else:
         cid = upd.effective_chat.id
     cfg["report_chat_id"] = cid
     save_cfg(cfg)
-    await upd.message.reply_text(
-        f"✅ Đã lưu nơi nhận báo cáo/nhắc: {cid} — bot sẽ gửi tự động."
-    )
+    await upd.message.reply_text(f"✅ Đã lưu nơi nhận báo cáo/nhắc: {cid}.")
 
-# ----- TẠO DÂY (đủ tham số hoặc wizard 1-lần) -----
 async def cmd_new(upd: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    chat_id = upd.effective_chat.id
+    """
+    /tao <ten> <tuan|thang> <DD-MM-YYYY> <so_chan> <menh_gia> <gia_san_%> <gia_tran_%> <dau_thao_%>
+    Thiếu tham số -> bật wizard hỏi lần lượt.
+    """
+    user_id = upd.effective_user.id if upd.effective_user else None
+    if len(ctx.args) < 8:
+        return await _wizard_begin(user_id, upd)
+
     try:
-        # Đủ tham số?
-        if len(ctx.args) >= 8:
-            name, kind, start_user, legs, contrib, base_rate, cap_rate, thau_rate = ctx.args[:8]
-            await _create_line_and_reply(upd, name, kind, start_user, legs, contrib, base_rate, cap_rate, thau_rate)
-            return
+        name, kind, start_user, legs, contrib, base_rate, cap_rate, thau_rate = ctx.args
+        start_dt  = parse_user_date(start_user)
+        start_iso = to_iso_str(start_dt)
+        period_days = 7 if kind.lower() in ["tuan","tuần","week","weekly"] else 30
+        legs    = int(legs)
+        contrib = parse_money(contrib)
+        base_rate = float(base_rate); cap_rate  = float(cap_rate); thau_rate = float(thau_rate)
 
-        # Thiếu tham số -> bật wizard "điền 1 lần"
-        expect = ["ten","chu_ky","ngay","sochan","menhgia","san","tran","thau"]
-        start_session(chat_id, "tao", expect, "/tao")
-        form = (
-            "🧩 **Điền nhanh tạo dây** – hãy trả lời **một tin duy nhất** gồm các dòng (hoặc dùng dấu `|`) theo thứ tự:\n"
-            "1) Tên dây (vd: Hui10tr)\n"
-            "2) Chu kỳ: `tuần` hoặc `tháng` (có thể gõ `tuan`/`thang`)\n"
-            "3) Ngày mở (DD-MM-YYYY), vd: 10-10-2025\n"
-            "4) Số chân (vd: 12)\n"
-            "5) Mệnh giá M (vd: 10tr, 2500k, 2.5tr)\n"
-            "6) Giá **sàn %** (vd: 8)\n"
-            "7) Giá **trần %** (vd: 20)\n"
-            "8) **Đầu thảo %** (vd: 50)\n\n"
-            "Ví dụ trả lời (nhiều dòng):\n"
-            "`Hui10tr`\n`tuan`\n`10-10-2025`\n`12`\n`10tr`\n`8`\n`20`\n`50`\n\n"
-            "Hoặc một dòng: `Hui10tr | tuan | 10-10-2025 | 12 | 10tr | 8 | 20 | 50`\n"
-            "🚫 Thoát wizard: /huy"
+        if not (0 <= base_rate <= cap_rate <= 100):
+            raise ValueError("gia_san_% <= gia_tran_% và trong [0..100]")
+        if not (0 <= thau_rate <= 100):
+            raise ValueError("dau_thao_% trong [0..100]")
+
+        conn = db()
+        conn.execute(
+            """INSERT INTO lines(name,period_days,start_date,legs,contrib,
+                                 bid_type,bid_value,status,created_at,
+                                 base_rate,cap_rate,thau_rate,remind_hour,remind_min,last_remind_iso)
+               VALUES(?,?,?,?,?,'dynamic',0,'OPEN',?, ?, ?, ?, 8, 0, NULL)""",
+            (name, period_days, start_iso, legs, contrib,
+             datetime.now().isoformat(), base_rate, cap_rate, thau_rate)
         )
-        await upd.message.reply_text(form, parse_mode="Markdown")
+        conn.commit()
+        line_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+        conn.close()
+
+        await upd.message.reply_text(
+            f"✅ Tạo dây #{line_id} ({name}) — {'Hụi tuần' if period_days==7 else 'Hụi tháng'}\n"
+            f"Mở: {start_user} · Chân: {legs} · Mệnh giá: {contrib:,} VND\n"
+            f"SÀN {base_rate:.2f}% · TRẦN {cap_rate:.2f}% · THẢO {thau_rate:.2f}% (trên M)\n"
+            f"⏰ Nhắc mặc định: 08:00 (dùng /hen {line_id} HH:MM để đổi)\n"
+            f"➡️ Nhập thăm: /tham {line_id} <ky> <so_tien_tham> [DD-MM-YYYY]"
+        )
     except Exception as e:
-        await upd.message.reply_text(f"❌ Lỗi: {e}")
+        await upd.message.reply_text(
+            "❌ Cú pháp: /tao <ten> <tuan|thang> <DD-MM-YYYY> <so_chan> <menh_gia> <gia_san_%> <gia_tran_%> <dau_thao_%>\n"
+            "Ví dụ: /tao Hui10tr tuan 10-10-2025 12 10000000 8 20 50\n"
+            f"Lỗi: {e}"
+        )
 
-async def _create_line_and_reply(upd: Update, name, kind, start_user, legs, contrib, base_rate, cap_rate, thau_rate):
-    # Chuẩn hóa & validate
-    kind_l = str(kind).lower()
-    period_days = 7 if kind_l in ["tuan","tuần","t","week","weekly","tuần"] else 30
-    start_dt  = parse_user_date(start_user)
-    start_iso = to_iso_str(start_dt)
-    legs      = int(legs)
-    contrib_i = parse_money(contrib)
-    base_rate = float(base_rate); cap_rate = float(cap_rate); thau_rate = float(thau_rate)
-    if not (0 <= base_rate <= cap_rate <= 100): raise ValueError("sàn% <= trần% và nằm trong [0..100]")
-    if not (0 <= thau_rate <= 100): raise ValueError("đầu thảo% trong [0..100]")
-
-    conn = db()
-    conn.execute(
-        """INSERT INTO lines(name,period_days,start_date,legs,contrib,
-                             bid_type,bid_value,status,created_at,
-                             base_rate,cap_rate,thau_rate,remind_hour,remind_min,last_remind_iso)
-           VALUES(?,?,?,?,?,'dynamic',0,'OPEN',?, ?, ?, ?, 8, 0, NULL)""",
-        (name, period_days, start_iso, legs, contrib_i,
-         datetime.now().isoformat(), base_rate, cap_rate, thau_rate)
-    )
-    conn.commit()
-    line_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
-    conn.close()
-
-    await upd.message.reply_text(
-        f"✅ Tạo dây #{line_id} ({name}) — {'Hụi Tuần' if period_days==7 else 'Hụi Tháng'}\n"
-        f"• Mở: {to_user_str(start_dt)} · Chân: {legs} · Mệnh giá: {contrib_i:,} VND\n"
-        f"• Sàn {base_rate:.2f}% · Trần {cap_rate:.2f}% · Đầu thảo {thau_rate:.2f}% (trên M)\n"
-        f"⏰ Nhắc mặc định: 08:00 (đổi bằng `/hen {line_id} HH:MM`)\n"
-        f"➡️ Nhập thăm: `/tham {line_id} <kỳ> <số_tiền_thăm> [DD-MM-YYYY]`",
-        parse_mode="Markdown"
-    )
-
-# ----- THĂM (đủ tham số hoặc wizard 1-lần) -----
 async def cmd_tham(upd: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    chat_id = upd.effective_chat.id
-    if len(ctx.args) >= 3:
-        # đủ tham số
-        try:
-            line_id = int(ctx.args[0]); k = int(ctx.args[1])
-            bid     = parse_money(ctx.args[2])
-            rdate   = None
-            if len(ctx.args) >= 4:
-                rdate = to_iso_str(parse_user_date(ctx.args[3]))
-        except Exception as e:
-            return await upd.message.reply_text(f"❌ Tham số không hợp lệ: {e}")
+    if len(ctx.args) < 3:
+        return await upd.message.reply_text("❌ Cú pháp: /tham <ma_day> <ky> <so_tien_tham> [DD-MM-YYYY]")
+    try:
+        line_id = int(ctx.args[0])
+        k       = int(ctx.args[1])
+        bid     = parse_money(ctx.args[2])
+        rdate   = None
+        if len(ctx.args) >= 4:
+            rdate = to_iso_str(parse_user_date(ctx.args[3]))
+    except Exception as e:
+        return await upd.message.reply_text(f"❌ Tham số không hợp lệ: {e}")
 
-        await _save_tham(upd, line_id, k, bid, rdate)
-        return
-
-    # thiếu -> wizard 1 lần
-    start_session(chat_id, "tham", ["maday","ky","sotientham","ngay"], "/tham")
-    form = (
-        "🧩 **Nhập thăm nhanh** – trả lời **một tin** theo thứ tự (mỗi dòng hoặc dùng `|`):\n"
-        "1) Mã dây (vd: 1)\n"
-        "2) Kỳ (vd: 3)\n"
-        "3) Số tiền thăm (vd: 2tr, 750k, ...)\n"
-        "4) Ngày DD-MM-YYYY (bỏ trống = hôm nay)\n\n"
-        "Ví dụ:\n`1 | 3 | 2tr | 10-10-2025`\nhoặc nhiều dòng tương ứng.\n"
-        "🚫 Thoát: /huy"
-    )
-    await upd.message.reply_text(form, parse_mode="Markdown")
-
-async def _save_tham(upd: Update, line_id: int, k: int, bid: int, rdate_iso: str|None):
     line, _ = load_line_full(line_id)
-    if not line: return await upd.message.reply_text("❌ Không tìm thấy dây.")
+    if not line:
+        return await upd.message.reply_text("❌ Không tìm thấy dây.")
     if not (1 <= k <= int(line["legs"])):
         return await upd.message.reply_text(f"❌ Kỳ hợp lệ 1..{line['legs']}.")
 
@@ -409,32 +466,31 @@ async def _save_tham(upd: Update, line_id: int, k: int, bid: int, rdate_iso: str
     if bid < min_bid or bid > max_bid:
         return await upd.message.reply_text(
             f"❌ Thăm phải trong [{min_bid:,} .. {max_bid:,}] VND "
-            f"(Sàn {line['base_rate']}% · Trần {line['cap_rate']}% · M={M:,})"
+            f"(SÀN {line['base_rate']}% · TRẦN {line['cap_rate']}% trên M={M:,})"
         )
 
     conn = db()
     conn.execute("""
         INSERT INTO rounds(line_id,k,bid,round_date) VALUES(?,?,?,?)
         ON CONFLICT(line_id,k) DO UPDATE SET bid=excluded.bid, round_date=excluded.round_date
-    """, (line_id, k, bid, rdate_iso))
+    """, (line_id, k, bid, rdate))
     conn.commit(); conn.close()
 
     await upd.message.reply_text(
         f"✅ Lưu thăm kỳ {k} cho dây #{line_id}: {bid:,} VND"
-        + (f" · ngày {to_user_str(parse_iso(rdate_iso))}" if rdate_iso else "")
+        + (f" · ngày {ctx.args[3]}" if len(ctx.args)>=4 else "")
     )
 
-# ----- HẸN -----
 async def cmd_set_remind(upd: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if len(ctx.args) != 2:
-        return await upd.message.reply_text("❌ Cú pháp: /hen <mã_dây> <HH:MM>  (VD: /hen 1 07:45)")
+        return await upd.message.reply_text("❌ Cú pháp: /hen <ma_day> <HH:MM>  (VD: /hen 1 07:45)")
     try:
         line_id = int(ctx.args[0])
         hhmm = ctx.args[1]
         hh, mm = hhmm.split(":")
         hh = int(hh); mm = int(mm)
         if not (0 <= hh <= 23 and 0 <= mm <= 59):
-            raise ValueError("giờ/phút không hợp lệ")
+            raise ValueError("Giờ/phút không hợp lệ")
     except Exception as e:
         return await upd.message.reply_text(f"❌ Tham số không hợp lệ: {e}")
 
@@ -446,7 +502,6 @@ async def cmd_set_remind(upd: Update, ctx: ContextTypes.DEFAULT_TYPE):
     conn.commit(); conn.close()
     await upd.message.reply_text(f"✅ Đã đặt giờ nhắc cho dây #{line_id}: {hh:02d}:{mm:02d}")
 
-# ----- DANH SÁCH, TÓM TẮT, GỢI Ý, ĐÓNG -----
 async def cmd_list(upd: Update, ctx: ContextTypes.DEFAULT_TYPE):
     conn = db()
     rows = conn.execute(
@@ -456,20 +511,20 @@ async def cmd_list(upd: Update, ctx: ContextTypes.DEFAULT_TYPE):
     conn.close()
     if not rows:
         return await upd.message.reply_text("📂 Chưa có dây nào.")
-    out = ["📋 **Danh sách dây**:"]
+    out = ["📋 Danh sách dây:"]
     for r in rows:
         kind = "Tuần" if r[2]==7 else "Tháng"
         out.append(
-            f"• #{r[0]} · {r[1]} · {kind} · mở {to_user_str(parse_iso(r[3]))} · chân {r[4]} · M {r[5]:,} VND · "
-            f"sàn {r[6]:.2f}% · trần {r[7]:.2f}% · thầu {r[8]:.2f}% · nhắc {int(r[10]):02d}:{int(r[11]):02d} · {r[9]}"
+            f"#{r[0]} · {r[1]} · {kind} · mở {to_user_str(parse_iso(r[3]))} · chân {r[4]} · M {r[5]:,} VND · "
+            f"SÀN {r[6]:.2f}% · TRẦN {r[7]:.2f}% · THẢO {r[8]:.2f}% · nhắc {int(r[10]):02d}:{int(r[11]):02d} · {r[9]}"
         )
-    await upd.message.reply_text("\n".join(out), parse_mode="Markdown")
+    await upd.message.reply_text("\n".join(out))
 
 async def cmd_summary(upd: Update, ctx: ContextTypes.DEFAULT_TYPE):
     try:
         line_id = int(ctx.args[0])
     except Exception:
-        return await upd.message.reply_text("❌ Cú pháp: /tomtat <mã_dây>")
+        return await upd.message.reply_text("❌ Cú pháp: /tomtat <ma_day>")
 
     line, _ = load_line_full(line_id)
     if not line:
@@ -477,14 +532,14 @@ async def cmd_summary(upd: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     bids = get_bids(line_id)
     M, N = int(line["contrib"]), int(line["legs"])
-    cfg_line = f"Sàn {float(line.get('base_rate',0)):.2f}% · Trần {float(line.get('cap_rate',100)):.2f}% · Đầu thảo {float(line.get('thau_rate',0)):.2f}% (trên M)"
+    cfg_line = f"SÀN {float(line.get('base_rate',0)):.2f}% · TRẦN {float(line.get('cap_rate',100)):.2f}% · THẢO {float(line.get('thau_rate',0)):.2f}% trên M"
     k_now = max(1, min(len(bids)+1, N))
     p, r, po, paid = compute_profit_var(line, k_now, bids)
     bestk, (bp, br, bpo, bpaid) = best_k_var(line, bids, metric="roi")
 
     msg = [
         f"📌 Dây #{line['id']} · {line['name']} · {'Tuần' if line['period_days']==7 else 'Tháng'}",
-        f"• Mở: {to_user_str(parse_iso(line['start_date']))} · Chân: {N} · Mệnh giá/kỳ: {M:,} VND",
+        f"• Mở: {to_user_str(parse_iso(line['start_date']))} · Chân: {N} · Mệnh giá: {M:,} VND",
         f"• {cfg_line} · Nhắc {int(line.get('remind_hour',8)):02d}:{int(line.get('remind_min',0)):02d}",
         f"• Thăm: " + (", ".join([f"k{kk}:{int(b):,}" for kk,b in sorted(bids.items())]) if bids else "(chưa có)"),
         f"• Kỳ hiện tại ước tính: {k_now} · Payout: {po:,} · Đã đóng: {paid:,} → Lãi: {int(round(p)):,} (ROI {roi_to_str(r)})",
@@ -496,11 +551,11 @@ async def cmd_summary(upd: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 async def cmd_whenhot(upd: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if len(ctx.args) < 1:
-        return await upd.message.reply_text("❌ Cú pháp: /hoitot <mã_dây> [roi|lai]")
+        return await upd.message.reply_text("❌ Cú pháp: /hoitot <ma_day> [roi|lai]")
     try:
         line_id = int(ctx.args[0])
     except Exception:
-        return await upd.message.reply_text("❌ mã_dây phải là số.")
+        return await upd.message.reply_text("❌ ma_day phải là số.")
     metric = ctx.args[1].lower() if len(ctx.args) >= 2 else "roi"
     if metric not in ("roi", "lai"):
         metric = "roi"
@@ -512,7 +567,7 @@ async def cmd_whenhot(upd: Update, ctx: ContextTypes.DEFAULT_TYPE):
     bestk, (bp, br, bpo, bpaid) = best_k_var(line, bids, metric=("roi" if metric=="roi" else "lai"))
     await upd.message.reply_text(
         f"🔎 Gợi ý theo {'ROI%' if metric=='roi' else 'Lãi'}:\n"
-        f"• Nên hốt kỳ: {bestk}\n"
+        f"• Kỳ nên hốt: {bestk}\n"
         f"• Ngày dự kiến: {to_user_str(k_date(line,bestk))}\n"
         f"• Payout kỳ đó: {bpo:,}\n"
         f"• Đã đóng trước đó: {bpaid:,}\n"
@@ -523,7 +578,7 @@ async def cmd_close(upd: Update, ctx: ContextTypes.DEFAULT_TYPE):
     try:
         line_id = int(ctx.args[0])
     except Exception:
-        return await upd.message.reply_text("❌ Cú pháp: /dong <mã_dây>")
+        return await upd.message.reply_text("❌ Cú pháp: /dong <ma_day>")
     conn = db()
     conn.execute("UPDATE lines SET status='CLOSED' WHERE id=?", (line_id,))
     conn.commit(); conn.close()
@@ -557,12 +612,12 @@ async def send_monthly_report_bot(app):
         bestk, (bp, br, bpo, bpaid) = best_k_var(line, bids, metric="roi")
         lines.append(
             f"#{line['id']} · {line['name']} · {('Tuần' if line['period_days']==7 else 'Tháng')} · "
-            f"M {int(line['contrib']):,} · Sàn {float(line['base_rate']):.1f}% · Trần {float(line['cap_rate']):.1f}% · Thầu {float(line['thau_rate']):.1f}% · "
+            f"M {int(line['contrib']):,} · SÀN {float(line['base_rate']):.1f}% · TRẦN {float(line['cap_rate']):.1f}% · THẢO {float(line['thau_rate']):.1f}% · "
             f"Kỳ_now {k_now}: Lãi {int(round(p)):,} ({roi_to_str(ro)}) · Best k{bestk} {roi_to_str(br)}"
         )
 
-    txt = "📊 **Báo cáo tháng**:\n" + "\n".join(lines)
-    await app.bot.send_message(chat_id=chat_id, text=txt, parse_mode="Markdown")
+    txt = "📊 Báo cáo tháng:\n" + "\n".join(lines)
+    await app.bot.send_message(chat_id=chat_id, text=txt)
 
 # ----- NHẮC HẸN DÍ DỎM THEO KỲ (TUỲ GIỜ TỪNG DÂY) -----
 async def send_periodic_reminders(app):
@@ -599,7 +654,6 @@ async def send_periodic_reminders(app):
 
         if hh != int(remind_hour) or mm != int(remind_min):
             continue
-
         if last_remind_iso == now_d.isoformat():
             continue
 
@@ -607,7 +661,6 @@ async def send_periodic_reminders(app):
         N = int(legs)
         k_now = max(1, min(len(bids) + 1, N))
         open_day = (parse_iso(start_date_str) + timedelta(days=(k_now-1)*int(period_days))).date()
-
         if open_day != now_d:
             continue
 
@@ -618,11 +671,11 @@ async def send_periodic_reminders(app):
         D = int(round(int(M) * float(thau_rate) / 100.0))
 
         txt = (
-            f"📣 Nhắc hẹn cho dây #{line_id} – {name}\n"
+            f"📣 Nhắc dây #{line_id} – {name}\n"
             f"• Kỳ {k_now}/{N} · Ngày: {to_user_str(parse_iso(start_date_str) + timedelta(days=(k_now-1)*int(period_days)))}\n"
-            f"• Mệnh giá: {int(M):,} VND · Sàn {float(base_rate):.1f}% ({min_bid:,}) · Trần {float(cap_rate):.1f}% ({max_bid:,}) · Thầu {float(thau_rate):.1f}% ({D:,})\n\n"
+            f"• Mệnh giá: {int(M):,} VND · SÀN {float(base_rate):.1f}% ({min_bid:,}) · TRẦN {float(cap_rate):.1f}% ({max_bid:,}) · THẢO {float(thau_rate):.1f}% ({D:,})\n\n"
             f"➡️ {prompt}\n"
-            f"👉 Nhập: /tham {line_id} {k_now} <số_tiền_thăm>"
+            f"👉 Gõ nhanh: /tham {line_id} {k_now} <so_tien_tham>"
         )
         await app.bot.send_message(chat_id=chat_id, text=txt)
 
@@ -632,7 +685,6 @@ async def send_periodic_reminders(app):
 
 # ----- VÒNG LẶP NỀN -----
 async def monthly_report_loop(app):
-    """Mỗi ngày chờ đến REPORT_HOUR rồi gửi báo cáo tháng (nếu mùng 1)."""
     while True:
         now = datetime.now()
         target = datetime.combine(now.date(), dtime(hour=REPORT_HOUR))
@@ -642,7 +694,6 @@ async def monthly_report_loop(app):
         await send_monthly_report_bot(app)
 
 async def reminder_loop(app):
-    """Mỗi phút check nhắc hẹn cho từng dây theo giờ cấu hình."""
     while True:
         await send_periodic_reminders(app)
         await asyncio.sleep(REMINDER_TICK_SECONDS)
@@ -671,70 +722,6 @@ async def _post_init(app):
     asyncio.create_task(reminder_loop(app))
     print("🕒 Nền: báo cáo tháng & nhắc hẹn đã bật.")
 
-# ====== /huy & bộ xử lý wizard ======
-async def cmd_cancel(upd: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    end_session(upd.effective_chat.id)
-    await upd.message.reply_text("🛑 Đã huỷ chế độ điền nhanh.")
-
-async def handle_text(upd: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    chat_id = upd.effective_chat.id
-    if chat_id not in SESS:
-        return  # bỏ qua nếu không ở wizard
-
-    sess = SESS[chat_id]
-    mode = sess["mode"]
-    expect = sess["expect"]
-    data = sess["data"]
-
-    filled = parse_pack_reply(upd.message.text or "", expect)
-    data.update(filled)
-
-    # Kiểm tra còn thiếu gì
-    missing = [k for k in expect if (k not in data or str(data[k]).strip() == "")]
-    if missing:
-        # Gợi ý lại nhưng vẫn theo 1 tin nhắn
-        labels = {
-            "ten":"tên", "chu_ky":"chu kỳ (tuần/tháng)", "ngay":"ngày DD-MM-YYYY",
-            "sochan":"số chân", "menhgia":"mệnh giá", "san":"sàn %", "tran":"trần %", "thau":"đầu thảo %",
-            "maday":"mã dây", "ky":"kỳ", "sotientham":"số tiền thăm", "gio":"HH:MM"
-        }
-        items = "\n".join([f"- {labels.get(k,k)}" for k in missing])
-        await upd.message.reply_text(
-            "⚠️ Còn thiếu:\n" + items + "\n\n👉 Vui lòng trả lời **một tin** bổ sung theo đúng thứ tự còn thiếu (nhiều dòng hoặc dùng `|`).",
-            parse_mode="Markdown"
-        )
-        return
-
-    # Đủ rồi -> thực thi
-    try:
-        if mode == "tao":
-            await _create_line_and_reply(
-                upd,
-                data["ten"],
-                data["chu_ky"],
-                data["ngay"],
-                data["sochan"],
-                data["menhgia"],
-                data["san"],
-                data["tran"],
-                data["thau"],
-            )
-        elif mode == "tham":
-            rdate = None
-            if data.get("ngay"):
-                rdate = to_iso_str(parse_user_date(data["ngay"]))
-            await _save_tham(
-                upd,
-                int(data["maday"]),
-                int(data["ky"]),
-                parse_money(data["sotientham"]),
-                rdate
-            )
-        # kết thúc
-        end_session(chat_id)
-    except Exception as e:
-        await upd.message.reply_text(f"❌ Lỗi xử lý: {e}")
-
 # ---------- MAIN ----------
 def main():
     init_db()
@@ -744,7 +731,7 @@ def main():
 
     # Lệnh tiếng Việt (không dấu)
     app.add_handler(CommandHandler("start",    cmd_start))
-    app.add_handler(CommandHandler("lenh",     cmd_lenh))
+    app.add_handler(CommandHandler("huy",      cmd_huy))         # huỷ wizard
     app.add_handler(CommandHandler("baocao",   cmd_setreport))
     app.add_handler(CommandHandler("tao",      cmd_new))
     app.add_handler(CommandHandler("tham",     cmd_tham))
@@ -753,12 +740,11 @@ def main():
     app.add_handler(CommandHandler("tomtat",   cmd_summary))
     app.add_handler(CommandHandler("hoitot",   cmd_whenhot))
     app.add_handler(CommandHandler("dong",     cmd_close))
-    app.add_handler(CommandHandler("huy",      cmd_cancel))
 
-    # Bắt mọi tin nhắn văn bản cho wizard
-    app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), handle_text))
+    # Bắt văn bản trả lời cho wizard /tao
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, _wizard_on_text))
 
-    print("✅ Hui Bot (Render) đang chạy...")
+    print("✅ Hụi Bot (Render) đang chạy...")
     app.run_polling()
 
 if __name__ == "__main__":
