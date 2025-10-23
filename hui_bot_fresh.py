@@ -220,9 +220,10 @@ def help_text() -> str:
         "3) Đặt giờ nhắc riêng:\n"
         "   `/hen <mã_dây> <HH:MM>`  (ví dụ: `/hen 1 07:45`)\n\n"
         "4) Danh sách / Tóm tắt / Gợi ý hốt:\n"
-        "   `/danhsach`\n"
-        "   `/tomtat <mã_dây>`\n"
-        "   `/hottot <mã_dây> [roi%|lãi]`\n\n"
+"   `/danhsach`\n"
+"   `/tomtat <mã_dây>`\n"
+"   `/hottot <mã_dây> [Roi%|Lãi]`\n\n"
+"
         "5) Đóng dây: `/dong <mã_dây>`\n\n"
         "6) Cài nơi nhận báo cáo & nhắc (gửi vào chat hiện tại nếu không nhập):\n"
         "   `/baocao [chat_id]`\n\n"
@@ -496,28 +497,36 @@ async def cmd_summary(upd: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 async def cmd_whenhot(upd: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if len(ctx.args) < 1:
-        return await upd.message.reply_text("❌ Cú pháp: /hottot <mã_dây> [roi%|lãi]")
+        return await upd.message.reply_text("❌ Cú pháp: /hottot <mã_dây> [Roi%|Lãi]")
+
     try:
         line_id = int(ctx.args[0])
     except Exception:
         return await upd.message.reply_text("❌ mã_dây phải là số.")
-    metric = ctx.args[1].lower() if len(ctx.args) >= 2 else "roi"
-    if metric not in ("roi", "lai"):
-        metric = "roi"
+
+    # chuẩn hoá metric: hỗ trợ 'roi', 'roi%', 'lai', 'lãi', 'lãi%', ...
+    metric = "roi"
+    if len(ctx.args) >= 2:
+        raw = ctx.args[1].strip().lower().replace("%", "")
+        raw = strip_accents(raw)  # 'lãi' -> 'lai'
+        if raw in ("roi", "lai"):
+            metric = raw
 
     line, _ = load_line_full(line_id)
-    if not line: return await upd.message.reply_text("❌ Không tìm thấy dây.")
-    bids = get_bids(line_id)
+    if not line:
+        return await upd.message.reply_text("❌ Không tìm thấy dây.")
 
-    bestk, (bp, br, bpo, bpaid) = best_k_var(line, bids, metric=("roi" if metric=="roi" else "lai"))
+    bids = get_bids(line_id)
+    bestk, (bp, br, bpo, bpaid) = best_k_var(line, bids, metric=("roi" if metric == "roi" else "lai"))
     await upd.message.reply_text(
-        f"🔎 Gợi ý theo {'ROI%' if metric=='roi' else 'Lãi'}:\n"
+        f"🔎 Gợi ý theo {'ROI%' if metric == 'roi' else 'Lãi'}:\n"
         f"• Nên hốt kỳ: {bestk}\n"
         f"• Ngày dự kiến: {to_user_str(k_date(line,bestk))}\n"
         f"• Payout kỳ đó: {bpo:,}\n"
         f"• Đã đóng trước đó: {bpaid:,}\n"
         f"• Lãi ước tính: {int(round(bp)):,} — ROI: {roi_to_str(br)}"
     )
+
 
 async def cmd_close(upd: Update, ctx: ContextTypes.DEFAULT_TYPE):
     try:
@@ -751,7 +760,7 @@ def main():
     app.add_handler(CommandHandler("hen",      cmd_set_remind))
     app.add_handler(CommandHandler("danhsach", cmd_list))
     app.add_handler(CommandHandler("tomtat",   cmd_summary))
-    app.add_handler(CommandHandler("hoitot",   cmd_whenhot))
+    app.add_handler(CommandHandler("hottot", cmd_whenhot))
     app.add_handler(CommandHandler("dong",     cmd_close))
     app.add_handler(CommandHandler("huy",      cmd_cancel))
 
